@@ -1,0 +1,463 @@
+bash -lc 'set -euo pipefail; cat > quick_setup.sh << "SH"; echo "Starting FCPO Insight Bot setup..."; 
+#!/bin/bash
+set -euo pipefail
+trap "echo [ERROR] at line \$LINENO; exit 1" ERR
+
+echo "== System prep =="
+if [[ $EUID -eq 0 ]]; then echo "Dont run as root"; exit 1; fi
+sudo dnf -y update
+sudo dnf -y install epel-release
+sudo dnf -y groupinstall "Development Tools"
+sudo dnf -y install python3 python3-pip python3-devel python3-venv wget curl git nano htop screen tmux unzip gcc gcc-c++ make openssl-devel libffi-devel sqlite-devel zlib-devel bzip2-devel readline-devel firewalld
+sudo systemctl enable --now firewalld
+sudo firewall-cmd --permanent --add-service=ssh >/dev/null || true
+sudo firewall-cmd --reload >/dev/null || true
+
+echo "== TA-Lib build =="
+cd /tmp
+wget -q https://prdownloads.sourceforge.net/ta-lib/ta-lib-0.4.0-src.tar.gz
+tar -xzf ta-lib-0.4.0-src.tar.gz
+cd ta-lib && ./configure --prefix=/usr/local --quiet && make -s && sudo make install -s && sudo ldconfig
+cd ~
+mkdir -p ~/fcpo-insight-bot/{config,insights,core,utils,analyzers,data,logs,backups}
+cd ~/fcpo-insight-bot
+
+echo "== Python venv =="
+python3 -m venv venv
+source venv/bin/activate
+python -m pip install --upgrade pip setuptools wheel -q
+
+echo "== Requirements =="
+cat > requirements.txt << "EOF"
+httpx==0.27.*
+tenacity==8.2.*
+python-telegram-bot==21.6
+pandas==2.2.*
+numpy==1.26.*
+python-dotenv==1.0.*
+tradingview-ta==3.3.0
+tvdatafeed==2.1.4
+TA-Lib==0.4.28
+schedule==1.2.1
+pytz==2024.1
+python-dateutil==2.9.*
+matplotlib==3.9.*
+plotly==5.23.*
+EOF
+pip install -r requirements.txt -q
+
+echo "== .env template =="
+cat > .env.template << "EOF"
+# === API KEYS ===
+PERPLEXITY_API_KEY=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
+PPLX_MODEL=sonar-reasoning
+
+TELEGRAM_BOT_TOKEN=8237647208:AAFR_b0eBlZJ_gRA3vkZKp0mDpP3Ybt1-48
+TELEGRAM_CHAT_ID=1696057
+
+# === MARKET SOURCE ===
+FCPO_SYMBOL=FCPO1!
+FCPO_EXCHANGE=MYX
+
+# === BOT SETTINGS ===
+TIMEZONE=Asia/Kuala_Lumpur
+ANALYSIS_INTERVAL=300
+ALERT_COOLDOWN_MIN=15
+VOL_SPIKE_THRESHOLD=2.0
+RSI_LOW=30
+RSI_HIGH=70
+LOG_LEVEL=INFO
+NOTIFY_BRIEF=true
+
+# Trading hours
+MORNING_START=10:30
+MORNING_END=12:30
+AFTERNOON_START=14:30
+AFTERNOON_END=18:00
+EVENING_START=21:00
+EVENING_END=23:30
+
+# (Optional) TradingView history for lenses
+TV_USERNAME=fikrikhamis
+TV_PASSWORD=@KongsiTv123
+HISTORY_TIMEFRAME=15
+HISTORY_LIMIT=300
+EOF
+[[ -f .env ]] || cp .env.template .env
+chmod 600 .env
+
+echo "== Write package inits =="
+for d in config insights core utils analyzers; do mkdir -p $d; echo -n > $d/__init__.py; done
+
+echo "== Write config/settings.py =="
+cat > config/settings.py << "EOF"
+import os
+from dotenv import load_dotenv
+import pytz
+from dataclasses import dataclass
+load_dotenv()
+@dataclass
+class Config:
+    PERPLEXITY_API_KEY: str = os.getenv("PERPLEXITY_API_KEY","")
+    PPLX_MODEL: str = os.getenv("PPLX_MODEL","sonar-reasoning")
+    TELEGRAM_BOT_TOKEN: str = os.getenv("TELEGRAM_BOT_TOKEN","")
+    TELEGRAM_CHAT_ID: str = os.getenv("TELEGRAM_CHAT_ID","")
+    FCPO_SYMBOL: str = os.getenv("FCPO_SYMBOL","FCPO1!")
+    FCPO_EXCHANGE: str = os.getenv("FCPO_EXCHANGE","MYX")
+    TIMEZONE = pytz.timezone(os.getenv("TIMEZONE","Asia/Kuala_Lumpur"))
+    ANALYSIS_INTERVAL: int = int(os.getenv("ANALYSIS_INTERVAL",300))
+    ALERT_COOLDOWN_MIN: int = int(os.getenv("ALERT_COOLDOWN_MIN",15))
+    VOL_SPIKE_THRESHOLD: float = float(os.getenv("VOL_SPIKE_THRESHOLD",2.0))
+    RSI_LOW: float = float(os.getenv("RSI_LOW",30))
+    RSI_HIGH: float = float(os.getenv("RSI_HIGH",70))
+    LOG_LEVEL: str = os.getenv("LOG_LEVEL","INFO")
+    NOTIFY_BRIEF: bool = os.getenv("NOTIFY_BRIEF","true").lower()=="true"
+    TRADING_HOURS = {
+        "morning": (os.getenv("MORNING_START","10:30"), os.getenv("MORNING_END","12:30")),
+        "afternoon": (os.getenv("AFTERNOON_START","14:30"), os.getenv("AFTERNOON_END","18:00")),
+        "evening": (os.getenv("EVENING_START","21:00"), os.getenv("EVENING_END","23:30")),
+    }
+    @classmethod
+    def validate(cls):
+        miss=[]
+        for k in ["TELEGRAM_BOT_TOKEN","TELEGRAM_CHAT_ID"]:
+            if not getattr(cls,k): miss.append(k)
+        if miss: raise ValueError(f"Missing env: {miss}")
+        return True
+EOF
+
+echo "== Write utils/telegram_sender.py =="
+cat > utils/telegram_sender.py << "EOF"
+import logging
+from telegram import Bot
+from telegram.error import TelegramError
+from config.settings import Config
+class TelegramSender:
+    def __init__(self):
+        self.cfg=Config(); self.bot=Bot(token=self.cfg.TELEGRAM_BOT_TOKEN)
+        self.chat_id=self.cfg.TELEGRAM_CHAT_ID; self.log=logging.getLogger(__name__)
+    async def send_html(self, html:str):
+        try: await self.bot.send_message(chat_id=self.chat_id,text=html,parse_mode="HTML"); self.log.info("sent HTML")
+        except TelegramError as e: self.log.error(f"Telegram error: {e}")
+        except Exception as e: self.log.error(f"Unexpected telegram error: {e}")
+    async def send_text(self, text:str):
+        try: await self.bot.send_message(chat_id=self.chat_id,text=text); self.log.info("sent TEXT")
+        except TelegramError as e: self.log.error(f"Telegram error: {e}")
+        except Exception as e: self.log.error(f"Unexpected telegram error: {e}")
+EOF
+
+echo "== Write utils/data_fetcher.py =="
+cat > utils/data_fetcher.py << "EOF"
+import logging
+from datetime import datetime
+from tradingview_ta import TA_Handler, Interval
+from config.settings import Config
+class DataFetcher:
+    def __init__(self):
+        self.cfg=Config(); self.log=logging.getLogger(__name__)
+        self.handler=TA_Handler(symbol=self.cfg.FCPO_SYMBOL,screener="futures",exchange=self.cfg.FCPO_EXCHANGE,interval=Interval.INTERVAL_15_MINUTE)
+    def _f(self,d,k,default=0.0):
+        try: v=d.get(k,default); return float(v) if v is not None else default
+        except: return default
+    def fetch(self):
+        try:
+            a=self.handler.get_analysis(); ind=a.indicators or {}; summ=a.summary or {}
+            now=datetime.now(self.cfg.TIMEZONE)
+            return {
+                "timestamp":now,"open":self._f(ind,"open"),"high":self._f(ind,"high"),"low":self._f(ind,"low"),
+                "close":self._f(ind,"close"),"volume":self._f(ind,"volume",0.0),"rsi":self._f(ind,"RSI",50.0),
+                "macd":self._f(ind,"MACD.macd",0.0),"ema20":self._f(ind,"EMA20",0.0),"ema50":self._f(ind,"EMA50",0.0),
+                "recommendation":(summ.get("RECOMMENDATION") or "NEUTRAL").upper()
+            }
+        except Exception as e:
+            self.log.error(f"Failed get_analysis: {e}")
+            return None
+EOF
+
+echo "== Write utils/history_fetcher.py =="
+cat > utils/history_fetcher.py << "EOF"
+import logging, os
+from config.settings import Config
+try:
+    from tvDatafeed import TvDatafeed, Interval
+except Exception:
+    TvDatafeed, Interval = None, None
+INTERVAL_MAP={"1":Interval.in_1_min,"3":Interval.in_3_min,"5":Interval.in_5_min,"15":Interval.in_15_min,"30":Interval.in_30_min,"60":Interval.in_1_hour,"240":Interval.in_4_hour,"D":Interval.in_daily,"W":Interval.in_weekly} if Interval else {}
+class HistoryFetcher:
+    def __init__(self):
+        self.cfg=Config(); self.log=logging.getLogger(__name__); self._client=None; self._setup()
+    def _setup(self):
+        if TvDatafeed is None: self.log.warning("tvDatafeed not available; history disabled."); return
+        u=os.getenv("TV_USERNAME",""); p=os.getenv("TV_PASSWORD","")
+        try: self._client=TvDatafeed(u,p) if u and p else TvDatafeed()
+        except Exception as e: self.log.warning(f"tvDatafeed login failed: {e}"); self._client=None
+    def fetch_bars(self, limit=None, tf=None):
+        if self._client is None: return None
+        try:
+            tf=tf or os.getenv("HISTORY_TIMEFRAME","15"); limit=limit or int(os.getenv("HISTORY_LIMIT","300"))
+            iv=INTERVAL_MAP.get(str(tf), Interval.in_15_min) if Interval else None
+            df=self._client.get_hist(symbol=self.cfg.FCPO_SYMBOL,exchange=self.cfg.FCPO_EXCHANGE,interval=iv,n_bars=limit)
+            if df is None or df.empty: return None
+            df=df.rename(columns={"open":"o","high":"h","low":"l","close":"c","volume":"v"})
+            df.index=df.index.tz_localize("UTC").tz_convert(self.cfg.TIMEZONE)
+            return df
+        except Exception as e:
+            self.log.warning(f"fetch_bars failed: {e}"); return None
+EOF
+
+echo "== Write analyzers/lenses.py =="
+cat > analyzers/lenses.py << "EOF"
+import math
+from dataclasses import dataclass
+import pandas as pd
+@dataclass
+class Verdict:
+    view:str; note:str; conf:float
+def _atr(df,n=14):
+    tr=pd.concat([(df["h"]-df["l"]),(df["h"]-df["c"].shift()).abs(),(df["l"]-df["c"].shift()).abs()],axis=1).max(axis=1)
+    return tr.rolling(n).mean()
+def _ema(s,n): return s.ewm(span=n,adjust=False).mean()
+def _swing_high(df,lb=3):
+    i=len(df)-lb-1
+    if i<=lb: return None
+    w=df.iloc[i-lb:i+lb+1]; idx=w["h"].idxmax()
+    return idx if idx==w.index[lb] else None
+def _swing_low(df,lb=3):
+    i=len(df)-lb-1
+    if i<=lb: return None
+    w=df.iloc[i-lb:i+lb+1]; idx=w["l"].idxmin()
+    return idx if idx==w.index[lb] else None
+def crt_lens(df):
+    atr=_atr(df,20); r_now=(df["h"].iloc[-1]-df["l"].iloc[-1])
+    r_avg=float(atr.iloc[-1]) if not math.isnan(atr.iloc[-1]) else (df["h"]-df["l"]).tail(20).mean()
+    ratio=r_now/max(1e-9,r_avg)
+    if ratio>=1.8: return Verdict("trend",f"Range expansion ({ratio:.2f}× ATR) — possible impulsive leg",0.65)
+    if ratio<=0.6: return Verdict("neutral",f"Range contraction ({ratio:.2f}× ATR) — wait for break",0.55)
+    return Verdict("neutral",f"Normal range ({ratio:.2f}× ATR)",0.5)
+def wyckoff_lens(df):
+    ema20=_ema(df["c"],20); ema50=_ema(df["c"],50)
+    slope20=ema20.diff().tail(5).mean(); slope50=ema50.diff().tail(5).mean()
+    rng=(df["h"].tail(40).max()-df["l"].tail(40).min())/max(1e-9,df["c"].iloc[-1])
+    ema_rel=ema20.iloc[-1]-ema50.iloc[-1]
+    if abs(rng)<0.03 and ema_rel>0 and slope20>0: return Verdict("bullish","Potential accumulation ➜ uptrend bias",0.6)
+    if abs(rng)<0.03 and ema_rel<0 and slope20<0: return Verdict("bearish","Potential distribution ➜ downtrend bias",0.6)
+    if slope20>0 and slope50>0 and ema_rel>0: return Verdict("bullish","Uptrend (EMA20>EMA50, slopes up)",0.6)
+    if slope20<0 and slope50<0 and ema_rel<0: return Verdict("bearish","Downtrend (EMA20<EMA50, slopes down)",0.6)
+    return Verdict("neutral","Sideways/transition",0.5)
+def smc_bos_choch(df):
+    sh=_swing_high(df); sl=_swing_low(df); close=df["c"].iloc[-1]
+    tag="none"; note="No clear BOS/CHOCH"; conf=0.5
+    if sh:
+        if close>df.loc[sh,"h"]: tag,note,conf="BOS_up","BOS up (close > last swing high)",0.62
+        elif close<df.loc[sh,"l"]: tag,note,conf="CHOCH_down","CHOCH down (close < last swing high low)",0.58
+    if sl:
+        if close<df.loc[sl,"l"]: tag,note,conf="BOS_down","BOS down (close < last swing low)",0.62
+        elif close>df.loc[sl,"h"]: tag,note,conf="CHOCH_up","CHOCH up (close > last swing low high)",0.58
+    view="bullish" if "up" in tag else ("bearish" if "down" in tag else "neutral")
+    return Verdict(view,note,conf), {"swing_high":str(sh),"swing_low":str(sl),"tag":tag}
+def ict_fvg(df):
+    h2=df["h"].iloc[-3]; l2=df["l"].iloc[-3]; h0=df["h"].iloc[-1]; l0=df["l"].iloc[-1]
+    if l0>h2: return Verdict("bullish","Bull FVG present (displacement up)",0.6)
+    if h0<l2: return Verdict("bearish","Bear FVG present (displacement down)",0.6)
+    return Verdict("neutral","No clean FVG",0.5)
+def ict_liquidity_sweep(df):
+    prev_high=df["h"].iloc[-2]; prev_low=df["l"].iloc[-2]; c=df["c"].iloc[-1]; h=df["h"].iloc[-1]; l=df["l"].iloc[-1]
+    if h>prev_high and c<prev_high: return Verdict("bearish","Buy-side liquidity sweep (wick above prior high, close back)",0.6)
+    if l<prev_low and c>prev_low: return Verdict("bullish","Sell-side liquidity sweep (wick below prior low, close back)",0.6)
+    return Verdict("neutral","No obvious sweep",0.5)
+def pa_patterns(df):
+    o0,c0,h0,l0=df["o"].iloc[-1],df["c"].iloc[-1],df["h"].iloc[-1],df["l"].iloc[-1]
+    o1,c1=df["o"].iloc[-2],df["c"].iloc[-2]
+    body0=abs(c0-o0); range0=h0-l0; upper_wick=h0-max(o0,c0); lower_wick=min(o0,c0)-l0
+    if c0>o0 and c1<o1 and c0>=o1 and o0<=c1: return Verdict("bullish","Bullish engulfing",0.58)
+    if c0<o0 and c1>o1 and o0>=c1 and c0<=o1: return Verdict("bearish","Bearish engulfing",0.58)
+    if lower_wick>2*body0 and lower_wick>(range0*0.4): return Verdict("bullish","Bullish pin bar (long lower wick)",0.55)
+    if upper_wick>2*body0 and upper_wick>(range0*0.4): return Verdict("bearish","Bearish pin bar (long upper wick)",0.55)
+    return Verdict("neutral","No strong PA pattern",0.5)
+def build_lenses(df):
+    out={}
+    out["crt"]=crt_lens(df).__dict__ if df is not None else {"view":"neutral","note":"No history","conf":0.4}
+    out["wyckoff"]=wyckoff_lens(df).__dict__ if df is not None else {"view":"neutral","note":"No history","conf":0.4}
+    if df is not None:
+        bosv,extra=smc_bos_choch(df); out["smc"]={**bosv.__dict__,"extra":extra}
+        out["ict_fvg"]=ict_fvg(df).__dict__; out["ict_sweep"]=ict_liquidity_sweep(df).__dict__; out["pa"]=pa_patterns(df).__dict__
+    else:
+        out["smc"]={"view":"neutral","note":"No history","conf":0.4,"extra":{}}
+        out["ict_fvg"]={"view":"neutral","note":"No history","conf":0.4}
+        out["ict_sweep"]={"view":"neutral","note":"No history","conf":0.4}
+        out["pa"]={"view":"neutral","note":"No history","conf":0.4}
+    return out
+EOF
+
+echo "== Write insights/insight_engine.py =="
+cat > insights/insight_engine.py << "EOF"
+import json, logging, httpx
+from tenacity import retry, wait_exponential, stop_after_attempt
+from config.settings import Config
+class InsightEngine:
+    def __init__(self):
+        self.cfg=Config(); self.log=logging.getLogger(__name__); self.client=httpx.Client(timeout=30)
+    def _prompt(self, md, lenses):
+        return f"""
+You are an assistant for FCPO (BMD). Consider FIVE lenses: Wyckoff, Candle Range Theory (CRT), Smart Money Concepts (BOS/CHOCH), classic Price Action, and ICT (FVG & Liquidity Sweep).
+Current snapshot: close={md['close']:.2f}, rsi={md['rsi']:.1f}, ema20={md['ema20']:.2f}, ema50={md['ema50']:.2f}, macd={md['macd']:.2f}, tv_sum={md['recommendation']}.
+Heuristic lens results (from local analyzer) as JSON:
+{json.dumps(lenses)}
+Task: fuse these into a concise view. Return STRICT JSON:
+{{"insight":"<1-2 sentences>","bias":"bullish|bearish|neutral","confidence":0-1,"risk_factors":["...","..."],"lenses_view":{{"wyckoff":"<short>","crt":"<short>","smc":"<short>","pa":"<short>","ict":"<short>"}}}}
+Keep it short and actionable for alerts. Avoid trading instructions.
+""".strip()
+    @retry(wait=wait_exponential(min=1,max=8), stop=stop_after_attempt(3))
+    def ask(self, md:dict, lenses:dict)->dict:
+        if not self.cfg.PERPLEXITY_API_KEY:
+            return {"insight":"No AI key — using local lenses only.","bias":lenses.get("wyckoff",{}).get("view","neutral"),
+                    "confidence":0.4,"risk_factors":[],"lenses_view":{
+                        "wyckoff":lenses.get("wyckoff",{}).get("note","-"),
+                        "crt":lenses.get("crt",{}).get("note","-"),
+                        "smc":lenses.get("smc",{}).get("note","-"),
+                        "pa":lenses.get("pa",{}).get("note","-"),
+                        "ict":(lenses.get("ict_fvg",{}).get("note","-")+"; "+lenses.get("ict_sweep",{}).get("note","-"))
+                    }}
+        payload={"model":self.cfg.PPLX_MODEL,"temperature":0.2,
+                 "response_format":{"type":"json_schema","json_schema":{"name":"fcpo_insight_lenses",
+                    "schema":{"type":"object","properties":{
+                        "insight":{"type":"string"},"bias":{"type":"string","enum":["bullish","bearish","neutral"]},
+                        "confidence":{"type":"number"},"risk_factors":{"type":"array","items":{"type":"string"}},
+                        "lenses_view":{"type":"object","properties":{
+                            "wyckoff":{"type":"string"},"crt":{"type":"string"},"smc":{"type":"string"},"pa":{"type":"string"},"ict":{"type":"string"}},
+                            "required":["wyckoff","crt","smc","pa","ict"],"additionalProperties":False}},
+                        "required":["insight","bias","confidence","risk_factors","lenses_view"],"additionalProperties":False}}},
+                 "messages":[{"role":"user","content":self._prompt(md,lenses)}]}
+        r=self.client.post("https://api.perplexity.ai/chat/completions",
+                           headers={"Authorization":f"Bearer {self.cfg.PERPLEXITY_API_KEY}","Content-Type":"application/json"}, json=payload)
+        r.raise_for_status(); data=r.json(); content=data["choices"][0]["message"]["content"]
+        try: return json.loads(content)
+        except Exception:
+            return {"insight":content[:300],"bias":"neutral","confidence":0.4,"risk_factors":[],
+                    "lenses_view":{"wyckoff":lenses.get("wyckoff",{}).get("note","-"),
+                                   "crt":lenses.get("crt",{}).get("note","-"),
+                                   "smc":lenses.get("smc",{}).get("note","-"),
+                                   "pa":lenses.get("pa",{}).get("note","-"),
+                                   "ict":(lenses.get("ict_fvg",{}).get("note","-")+"; "+lenses.get("ict_sweep",{}).get("note","-"))}}
+EOF
+
+echo "== Write core/insight_bot.py =="
+cat > core/insight_bot.py << "EOF"
+import asyncio, logging, time
+from datetime import datetime, time as dtime
+from collections import deque
+from config.settings import Config
+from utils.data_fetcher import DataFetcher
+from utils.history_fetcher import HistoryFetcher
+from insights.insight_engine import InsightEngine
+from analyzers.lenses import build_lenses
+from utils.telegram_sender import TelegramSender
+def _in_range(now_t, start_s, end_s):
+    s=dtime.fromisoformat(start_s); e=dtime.fromisoformat(end_s)
+    return (s<=now_t<=e) if s<=e else (now_t>=s or now_t<=e)
+class InsightBot:
+    def __init__(self):
+        self.cfg=Config(); self.fetcher=DataFetcher(); self.engine=InsightEngine()
+        self.tg=TelegramSender(); self.log=logging.getLogger(__name__)
+        self.last_alert_at={}; self.window=deque(maxlen=40); self.hist=HistoryFetcher()
+    def is_trading_hours(self):
+        now=datetime.now(self.cfg.TIMEZONE).time(); th=self.cfg.TRADING_HOURS
+        return any(_in_range(now,*rng) for rng in th.values())
+    def _cooldown_ok(self,key:str)->bool:
+        cd=self.cfg.ALERT_COOLDOWN_MIN*60; t=time.time()
+        if t-self.last_alert_at.get(key,0)>=cd: self.last_alert_at[key]=t; return True
+        return False
+    def _detect_events(self,md):
+        ev=[]
+        if md["rsi"]<=self.cfg.RSI_LOW: ev.append(("rsi_low",f"RSI oversold ({md['rsi']:.1f})"))
+        if md["rsi"]>=self.cfg.RSI_HIGH: ev.append(("rsi_high",f"RSI overbought ({md['rsi']:.1f})"))
+        if md["ema20"] and md["ema50"]:
+            if md["ema20"]>md["ema50"]: ev.append(("ema_bull","EMA20 > EMA50 (bullish bias)"))
+            elif md["ema20"]<md["ema50"]: ev.append(("ema_bear","EMA20 < EMA50 (bearish bias)"))
+        self.window.append(md)
+        if len(self.window)>=10:
+            avg_vol=sum(x["volume"] for x in self.window)/len(self.window)
+            if md["volume"]>self.cfg.VOL_SPIKE_THRESHOLD*max(1.0,avg_vol):
+                ev.append(("vol_spike",f"Volume spike {md['volume']:.0f} vs avg {avg_vol:.0f}"))
+        return ev
+    async def _send_alert(self, md, ai, tags, lenses):
+        ts=md["timestamp"].strftime("%Y-%m-%d %H:%M"); lens=ai.get("lenses_view",{})
+        wy=lens.get("wyckoff","-"); crt=lens.get("crt","-"); smc=lens.get("smc","-"); pa=lens.get("pa","-"); ict=lens.get("ict","-")
+        if self.cfg.NOTIFY_BRIEF:
+            lines=[
+                "FCPO Insight Alert",
+                f"Time      : {ts} ({self.cfg.TIMEZONE})",
+                f"Price     : RM {md['close']:.2f}",
+                f"RSI/EMA   : {md['rsi']:.1f} | {md['ema20']:.0f}/{md['ema50']:.0f}",
+                f"TV Summary: {md['recommendation']}",
+                f"Bias(AI)  : {ai.get('bias','neutral')} (conf {ai.get('confidence',0):.2f})",
+                f"Insight   : {ai.get('insight','-')}",
+                f"Wyckoff   : {wy}",
+                f"CRT       : {crt}",
+                f"SMC       : {smc}",
+                f"PA        : {pa}",
+                f"ICT       : {ict}",
+                f"Events    : {', '.join(tags) or '-'}",
+                "Note: FYI only. No auto-trading."
+            ]
+            await self.tg.send_text("\n".join(lines))
+        else:
+            html=f"""
+<b>FCPO Insight Alert</b>
+Time: {ts} ({self.cfg.TIMEZONE})<br/>
+<b>Price:</b> RM {md['close']:.2f} | <b>RSI</b> {md['rsi']:.1f} | <b>EMA20/50</b> {md['ema20']:.0f}/{md['ema50']:.0f}<br/>
+<b>TV Summary:</b> {md['recommendation']}<br/><br/>
+<b>Bias(AI):</b> {ai.get('bias','neutral')} (conf {ai.get('confidence',0):.2f})<br/>
+<b>Insight:</b> {ai.get('insight','-')}<br/>
+<b>Risks:</b> {'; '.join(ai.get('risk_factors',[])[:3]) or '-'}<br/><br/>
+<b>Wyckoff:</b> {wy}<br/><b>CRT:</b> {crt}<br/><b>SMC:</b> {smc}<br/><b>PA:</b> {pa}<br/><b>ICT:</b> {ict}<br/><br/>
+<b>Events:</b> {', '.join(tags) or '-'}<br/><i>FYI only. No auto-trading.</i>
+""".strip()
+            await self.tg.send_html(html)
+    async def run_once(self):
+        if not self.is_trading_hours(): self.log.info("Outside trading hours"); return
+        md=self.fetcher.fetch()
+        if not md or md["close"]<=0: self.log.warning("No market data"); return
+        df=self.hist.fetch_bars()
+        lenses=build_lenses(df) if df is not None else {
+            "wyckoff":{"view":"neutral","note":"No history","conf":0.4},
+            "crt":{"view":"neutral","note":"No history","conf":0.4},
+            "smc":{"view":"neutral","note":"No history","conf":0.4,"extra":{}},
+            "ict_fvg":{"view":"neutral","note":"No history","conf":0.4},
+            "ict_sweep":{"view":"neutral","note":"No history","conf":0.4},
+            "pa":{"view":"neutral","note":"No history","conf":0.4},
+        }
+        ai=self.engine.ask(md,lenses); events=self._detect_events(md)
+        tags=[e[1] for e in events if self._cooldown_ok(e[0])]
+        if self._cooldown_ok("heartbeat"): tags.append("status")
+        if tags: await self._send_alert(md,ai,tags,lenses)
+        else: self.log.info("No alert (cooldown/no events)")
+    async def loop(self):
+        while True:
+            try: await self.run_once()
+            except Exception as e: self.log.exception(f"run_once error: {e}")
+            await asyncio.sleep(self.cfg.ANALYSIS_INTERVAL)
+EOF
+
+echo "== Write core/main.py =="
+cat > core/main.py << "EOF"
+import asyncio, logging
+from config.settings import Config
+from core.insight_bot import InsightBot
+def setup_logging():
+    cfg=Config(); level=getattr(logging,cfg.LOG_LEVEL.upper(),logging.INFO)
+    logging.basicConfig(level=level, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+async def amain():
+    Config.validate(); bot=InsightBot(); await bot.loop()
+if __name__=="__main__":
+    setup_logging(); asyncio.run(amain())
+EOF
+
+echo "== Done =="
+echo "Project at $PWD"
+echo "Next:"
+echo "  1) Edit .env (Perplexity + Telegram)"
+echo "  2) source venv/bin/activate"
+echo "  3) python -m core.main"
+SH
+bash quick_setup.sh'
